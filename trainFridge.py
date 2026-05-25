@@ -1,11 +1,6 @@
 """Training script for U-Net-based dehazing on the Fridge condensation dataset
-(real, paired clean / hazy images), trained with the conditional drifting loss.
-
-Generator: a residual U-Net (image-to-image), which is the standard choice for
-restoration tasks. Multi-scale ResBlock encoder + decoder with skip connections
-preserves fine-grained spatial detail; a self-attention block at the bottleneck
-gives the model a global view of the haze pattern. The output predicts a
-residual added to ``x_hazy`` so the model starts as identity.
+(real, paired clean / hazy images), trained with a feature-space conditional
+drifting loss.
 """
 
 import argparse
@@ -395,41 +390,99 @@ class UNetDehazer(nn.Module):
         return (x_hazy + residual).clamp(-1.0, 1.0)
 
 
-# ---------------------------------------------------------------------------
-# 3. Conditional drift loss (per-exddample positive set of size 1)
-# ---------------------------------------------------------------------------
+# 3. Conditional drifting loss in encoder feature space
 
+def compute_drifting_loss(
+    x_gen: torch.Tensor,
+    x_pos: torch.Tensor,
+    feature_encoder: Optional[nn.Module],
+    feature_encoder_target: Optional[nn.Module] = None,
+    temperatures: Tuple[float, ...] = (0.05, 0.2, 0.5),
+    feature_levels: Optional[Tuple[int, ...]] = None,
+    use_pixel_space: bool = False,
+) -> Tuple[torch.Tensor, dict]:
 
-def conditional_drift_loss(
-    x_hat: torch.Tensor,
-    x_clean: torch.Tensor,
-    temperatures: List[float] = (0.05, 0.2, 0.5),
-) -> torch.Tensor:
-    """Per-example "conditional drifting" loss.
     """
-    feat_gen = x_hat.flatten(start_dim=1)
-    feat_pos = x_clean.flatten(start_dim=1)
+    Conditional drifting loss with the same encoder in the model
+    """
+    device = x_gen.device
 
-    feat_gen_norm = F.normalize(feat_gen, p=2, dim=1)
-    feat_pos_norm = F.normalize(feat_pos, p=2, dim=1)
+    # ----- Extract features -----
+    if use_pixel_space or feature_encoder is None:
+        # Pixel space: single "scale".
+        feat_gen_list = [x_gen.flatten(start_dim=1)]
+        feat_pos_list = [x_pos.flatten(start_dim=1)]
+    else:
+        target_encoder = (
+            feature_encoder_target if feature_encoder_target is not None
+            else feature_encoder
+        )
 
-    v_total = torch.zeros_like(feat_gen_norm)
-    for tau in temperatures:
-        # Negatives = other generated samples (mask_self=True drops the diagonal).
-        v_tau = compute_V(feat_gen_norm, feat_pos_norm, feat_gen_norm, tau, mask_self=True)
-        v_norm = torch.sqrt(torch.mean(v_tau ** 2) + 1e-8)
-        v_total = v_total + v_tau / (v_norm + 1e-8)
+        # Multi-scale feature maps from the U-Net encoder (list of (B, C, H, W)).
+        feat_gen_maps = feature_encoder(x_gen)
+        with torch.no_grad():
+            feat_pos_maps = target_encoder(x_pos)
 
-    target = (feat_gen_norm + v_total).detach()
-    return F.mse_loss(feat_gen_norm, target)
+        if feature_levels is not None:
+            feat_gen_maps = [feat_gen_maps[i] for i in feature_levels]
+            feat_pos_maps = [feat_pos_maps[i] for i in feature_levels]
+
+        # Global-average-pool each scale to get vectors (matches train.py).
+        feat_gen_list = [F.adaptive_avg_pool2d(f, 1).flatten(1) for f in feat_gen_maps]
+        feat_pos_list = [F.adaptive_avg_pool2d(f, 1).flatten(1) for f in feat_pos_maps]
+
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    total_drift_norm = 0.0
+    num_losses = 0
+
+    # ----- Loss per scale -----
+    for feat_gen, feat_pos in zip(feat_gen_list, feat_pos_list):
+        # L2-normalise (project to unit sphere).
+        feat_gen_norm = F.normalize(feat_gen, p=2, dim=1)
+        feat_pos_norm = F.normalize(feat_pos, p=2, dim=1)
+
+        # Negatives = other generated samples (Algorithm 1: y_neg = x).
+        feat_neg_norm = feat_gen_norm
+
+        # Compute V at multiple temperatures, each normalised before summing.
+        V_total = torch.zeros_like(feat_gen_norm)
+        for tau in temperatures:
+            V_tau = compute_V(
+                feat_gen_norm,
+                feat_pos_norm,
+                feat_neg_norm,
+                tau,
+                mask_self=True,  # y_neg = x, so mask self
+            )
+            v_norm = torch.sqrt(torch.mean(V_tau ** 2) + 1e-8)
+            V_tau = V_tau / (v_norm + 1e-8)
+            V_total = V_total + V_tau
+
+        # Loss: MSE(phi(x), stopgrad(phi(x) + V))
+        target = (feat_gen_norm + V_total).detach()
+        loss_scale = F.mse_loss(feat_gen_norm, target)
+
+        total_loss = total_loss + loss_scale
+        total_drift_norm += (V_total ** 2).mean().item() ** 0.5
+        num_losses += 1
+
+    if num_losses == 0:
+        return (
+            torch.tensor(0.0, device=device, requires_grad=True),
+            {"loss": 0.0, "drift_norm": 0.0},
+        )
+
+    loss = total_loss / num_losses
+    info = {
+        "loss": loss.item(),
+        "drift_norm": total_drift_norm / num_losses,
+    }
+    return loss, info
 
 
 
 # 4. Training
 
-"""
-In here, we throw away the noise z
-"""
 def train(
     epochs: int = 200,
     batch_size: int = 4,
@@ -444,6 +497,11 @@ def train(
     grad_clip: float = 2.0,
     warmup_steps: int = 2000,
     ema_decay: float = 0.999,
+    lambda_recon: float = 1.0,
+    lambda_drift: float = 1.0,
+    feature_levels: Optional[Tuple[int, ...]] = None,
+    temperatures: Tuple[float, ...] = (0.05, 0.2, 0.5),
+    pixel_drift: bool = False,
     val_fraction: float = 0.1,
     data_dir: str = "./condensation_data",
     output_dir: str = "./outputs/dehaze_fridge",
@@ -513,6 +571,33 @@ def train(
     )
     scheduler = WarmupLRScheduler(optimizer, warmup_steps=warmup_steps, base_lr=lr)
 
+    # ----- Explicit encoders used by the drifting loss -----
+    # feature_encoder         = the trainable U-Net encoder (model.encoder).
+    # feature_encoder_target  = the EMA copy of that encoder (ema.shadow.encoder).
+    feature_encoder = None if pixel_drift else model.encoder
+    feature_encoder_target = None if pixel_drift else ema.shadow.encoder
+
+    if pixel_drift:
+        print(
+            "Loss: total = "
+            f"{lambda_recon} * L1 + {lambda_drift} * drift_pixel (no encoder)"
+        )
+    else:
+        n_enc_levels = len(model.encoder.channel_mults)
+        levels_str = (
+            "all levels" if feature_levels is None
+            else f"levels={list(feature_levels)}"
+        )
+        print(
+            "Loss: total = "
+            f"{lambda_recon} * L1 + {lambda_drift} * drift_feature\n"
+            f"  feature_encoder        = model.encoder (trainable U-Net encoder, "
+            f"{n_enc_levels} levels)\n"
+            f"  feature_encoder_target = ema.shadow.encoder (EMA copy, no grads)\n"
+            f"  using {levels_str}, temperatures={list(temperatures)}, "
+            f"GAP -> flatten -> L2-normalise per scale"
+        )
+
     def checkpoint_payload():
         return {
             "model": model.state_dict(),
@@ -526,6 +611,13 @@ def train(
                 "num_heads": num_heads,
                 "in_channels": 3,
                 "out_channels": 3,
+                "lambda_recon": lambda_recon,
+                "lambda_drift": lambda_drift,
+                "feature_levels": (
+                    None if feature_levels is None else list(feature_levels)
+                ),
+                "temperatures": list(temperatures),
+                "pixel_drift": pixel_drift,
             },
         }
 
@@ -540,7 +632,7 @@ def train(
     global_step = 0
     for epoch in range(epochs):
         epoch_start = time.time()
-        running = {"loss": 0.0, "n": 0}
+        running = {"loss": 0.0, "recon": 0.0, "drift": 0.0, "drift_norm": 0.0, "n": 0}
 
         for batch_idx, (x_clean, x_hazy) in enumerate(train_loader):
             x_clean = x_clean.to(device, non_blocking=True)
@@ -548,7 +640,18 @@ def train(
 
             x_hat = model(x_hazy)
 
-            loss = conditional_drift_loss(x_hat, x_clean)
+            # Drifting loss in encoder feature space (or pixel space if pixel_drift).
+            drift_loss, info = compute_drifting_loss(
+                x_gen=x_hat,
+                x_pos=x_clean,
+                feature_encoder=feature_encoder,
+                feature_encoder_target=feature_encoder_target,
+                temperatures=temperatures,
+                feature_levels=feature_levels,
+                use_pixel_space=pixel_drift,
+            )
+            recon_loss = F.l1_loss(x_hat, x_clean)
+            loss = lambda_recon * recon_loss + lambda_drift * drift_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -558,15 +661,20 @@ def train(
             ema.update(model)
 
             running["loss"] += loss.item()
+            running["recon"] += recon_loss.item()
+            running["drift"] += info["loss"]
+            running["drift_norm"] += info["drift_norm"]
             running["n"] += 1
             global_step += 1
 
             if global_step % effective_log_interval == 0:
-                avg = {k: v / max(running["n"], 1) for k, v in running.items() if k != "n"}
+                n = max(running["n"], 1)
                 print(
                     f"Epoch {epoch + 1}/{epochs} | step {global_step} | "
-                    f"loss {avg['loss']:.4f} | grad {grad_norm:.2f} | "
-                    f"lr {scheduler.get_lr():.6f}"
+                    f"loss {running['loss'] / n:.4f} "
+                    f"(recon {running['recon'] / n:.4f}, drift {running['drift'] / n:.4f}) | "
+                    f"drift_norm {running['drift_norm'] / n:.4f} | "
+                    f"grad {grad_norm:.2f} | lr {scheduler.get_lr():.6f}"
                 )
 
             if sample_interval > 0 and global_step % sample_interval == 0:
@@ -585,9 +693,12 @@ def train(
                 return
 
         elapsed = time.time() - epoch_start
+        n = max(running["n"], 1)
         print(
             f"Epoch {epoch + 1} done in {elapsed:.1f}s | "
-            f"avg loss {running['loss'] / max(running['n'], 1):.4f}"
+            f"avg loss {running['loss'] / n:.4f} "
+            f"(recon {running['recon'] / n:.4f}, drift {running['drift'] / n:.4f}) | "
+            f"avg drift_norm {running['drift_norm'] / n:.4f}"
         )
 
         epoch_num = epoch + 1
@@ -648,6 +759,14 @@ def _parse_int_list(s: str) -> Tuple[int, ...]:
     return tuple(int(part) for part in s.split(","))
 
 
+def _parse_float_list(s: str) -> Tuple[float, ...]:
+    """Parse comma-separated floats, e.g. '0.05,0.2,0.5' -> (0.05, 0.2, 0.5)."""
+    s = s.strip()
+    if not s:
+        return ()
+    return tuple(float(part) for part in s.split(","))
+
+
 def main():
     p = argparse.ArgumentParser(description="Fridge condensation U-Net dehazing training.")
     p.add_argument("--epochs", type=int, default=200)
@@ -668,6 +787,23 @@ def main():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--warmup_steps", type=int, default=2000)
     p.add_argument("--val_fraction", type=float, default=0.1)
+    p.add_argument("--lambda_recon", type=float, default=1.0,
+                   help="Weight of the L1 reconstruction loss.")
+    p.add_argument("--lambda_drift", type=float, default=1.0,
+                   help="Weight of the drifting loss.")
+    p.add_argument("--feature_levels", type=_parse_int_list, default=None,
+                   help="Encoder skip-pyramid levels used by the feature-space "
+                        "drift loss (comma-separated, negative indices count "
+                        "from the deepest level). Default: all levels (matches "
+                        "train.py). Examples: '-1' = deepest only; '-2,-1' = "
+                        "two deepest.")
+    p.add_argument("--temperatures", type=_parse_float_list,
+                   default=(0.05, 0.2, 0.5),
+                   help="Drifting field temperatures (sharper -> softer).")
+    p.add_argument("--pixel_drift", action="store_true",
+                   help="Ablation: compute the drifting loss in raw pixel space "
+                        "(flattened RGB) instead of in encoder feature space. "
+                        "No encoder is used in this mode.")
     p.add_argument(
         "--data_dir",
         type=str,
@@ -702,6 +838,11 @@ def main():
         num_heads=args.num_heads,
         lr=args.lr,
         warmup_steps=args.warmup_steps,
+        lambda_recon=args.lambda_recon,
+        lambda_drift=args.lambda_drift,
+        feature_levels=args.feature_levels,
+        temperatures=args.temperatures,
+        pixel_drift=args.pixel_drift,
         val_fraction=args.val_fraction,
         data_dir=args.data_dir,
         output_dir=args.output_dir,
