@@ -23,6 +23,7 @@ from losses import (
     make_multiscale_feature_encoder,
 )
 from model import DiTBlock, FinalLayer, PatchEmbed, RotaryPositionEmbedding
+from models.residual_unet import ResidualUNetDehazer
 from unet import UNetDehazer
 from utils import EMA, WarmupLRScheduler, count_parameters, save_image_grid, set_seed
 
@@ -76,6 +77,10 @@ def apply_prediction_mode(
     if prediction_mode == "residual":
         return (x_hazy + raw_output).clamp(-1.0, 1.0)
     raise ValueError(f"Unknown prediction mode: {prediction_mode}")
+
+
+def model_outputs_final_prediction(model_type: str) -> bool:
+    return model_type == "residual_unet"
 
 
 def apply_selected_fog(
@@ -684,6 +689,14 @@ def build_dehazing_model(
             base_channels=unet_base_channels,
             depth=unet_depth,
         )
+    if model_type == "residual_unet":
+        return ResidualUNetDehazer(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            base_channels=unet_base_channels,
+            depth=unet_depth,
+            num_heads=num_heads,
+        )
     raise ValueError(f"Unknown model type: {model_type}")
 
 
@@ -773,12 +786,15 @@ def train(
     set_seed(seed)
     name = dataset.lower()
     in_channels = dataset_channels(name)
-    if model_type not in ("dit", "unet"):
+    if model_type not in ("dit", "unet", "residual_unet"):
         raise ValueError(f"Unknown model type: {model_type}")
     if drift_space not in ("pixel", "feature"):
         raise ValueError(f"Unknown drift space: {drift_space}")
     if feature_encoder not in ("none", "multiscale"):
         raise ValueError(f"Unknown feature encoder: {feature_encoder}")
+    effective_prediction_mode = (
+        "direct" if model_outputs_final_prediction(model_type) else prediction_mode
+    )
     uses_drift_loss = loss_mode in ("drift", "mixed")
     effective_drift_space = drift_space if uses_drift_loss else "pixel"
     effective_feature_encoder = feature_encoder if effective_drift_space == "feature" else "none"
@@ -832,17 +848,29 @@ def train(
             "Model config: "
             f"preset={model_preset}, hidden_size={hidden_size}, depth={depth}, num_heads={num_heads}"
         )
+    elif model_type == "residual_unet":
+        print(
+            "Model config: "
+            f"type=residual_unet, input_channels={in_channels}, output_channels={in_channels}, "
+            f"base_channels={unet_base_channels}, depth={unet_depth}, num_heads={num_heads}"
+        )
     else:
         print(
             "Model config: "
             f"type=unet, input_channels={2 * in_channels}, output_channels={in_channels}, "
             f"base_channels={unet_base_channels}, depth={unet_depth}"
         )
+    if prediction_mode != effective_prediction_mode:
+        print(
+            "Prediction mode: "
+            f"requested={prediction_mode}, effective={effective_prediction_mode} "
+            f"because {model_type} returns the final dehazed image."
+        )
     print(
         "Ablation config: "
         f"fog={fog_preset}, fog_type={fog_type}, beta={fog_config['beta_range']}, "
         f"blur={fog_config['blur_sigma_range']}, depth_mode={depth_mode}, "
-        f"noise={noise_mode}, prediction={prediction_mode}, loss_mode={loss_mode}, "
+        f"noise={noise_mode}, prediction={effective_prediction_mode}, loss_mode={loss_mode}, "
         f"drift_space={effective_drift_space}, drift_positive_mode={drift_positive_mode}, "
         f"feature_encoder={effective_feature_encoder}, "
         f"freeze_feature_encoder={effective_freeze_feature_encoder}, "
@@ -859,7 +887,8 @@ def train(
         "a_range": fog_config["a_range"],
         "blur_sigma_range": fog_config["blur_sigma_range"],
         "noise_mode": noise_mode,
-        "prediction_mode": prediction_mode,
+        "prediction_mode": effective_prediction_mode,
+        "requested_prediction_mode": prediction_mode,
         "loss_mode": loss_mode,
         "drift_space": effective_drift_space,
         "drift_positive_mode": drift_positive_mode,
@@ -998,7 +1027,8 @@ def train(
                 "a_range": fog_config["a_range"],
                 "blur_sigma_range": fog_config["blur_sigma_range"],
                 "noise_mode": noise_mode,
-                "prediction_mode": prediction_mode,
+                "prediction_mode": effective_prediction_mode,
+                "requested_prediction_mode": prediction_mode,
                 "loss_mode": loss_mode,
                 "drift_space": effective_drift_space,
                 "drift_positive_mode": drift_positive_mode,
@@ -1026,7 +1056,7 @@ def train(
             vis_hazy,
             path,
             noise_mode=noise_mode,
-            prediction_mode=prediction_mode,
+            prediction_mode=effective_prediction_mode,
             run_config=run_config,
             feature_extractor=drift_feature_extractor,
         )
@@ -1052,7 +1082,7 @@ def train(
             raw_output = model(z, x_hazy)
             if raw_output.shape != x_clean.shape:
                 raise RuntimeError(f"Model output shape {tuple(raw_output.shape)} != clean {tuple(x_clean.shape)}")
-            x_hat = apply_prediction_mode(raw_output, x_hazy, prediction_mode)
+            x_hat = apply_prediction_mode(raw_output, x_hazy, effective_prediction_mode)
             if x_hat.shape != x_clean.shape:
                 raise RuntimeError(f"Dehazed output shape {tuple(x_hat.shape)} != clean {tuple(x_clean.shape)}")
 
@@ -1399,6 +1429,7 @@ def save_metrics(path: Path, metrics: Dict[str, float], run_config: Dict[str, An
         "blur_sigma_range",
         "noise_mode",
         "prediction_mode",
+        "requested_prediction_mode",
         "loss_mode",
         "drift_space",
         "drift_positive_mode",
@@ -1442,7 +1473,7 @@ def main():
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--img_size", type=int, default=None)
     p.add_argument("--model_preset", choices=["small", "medium", "large", "custom"], default="small")
-    p.add_argument("--model_type", choices=["dit", "unet"], default="dit")
+    p.add_argument("--model_type", choices=["dit", "unet", "residual_unet"], default="dit")
     p.add_argument("--hidden_size", type=int, default=192)
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--num_heads", type=int, default=4)
