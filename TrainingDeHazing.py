@@ -4,7 +4,7 @@ import math
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -454,6 +454,152 @@ class RealRGBFolderDataset(Dataset):
         return x_clean.squeeze(0), x_hazy.squeeze(0), -1
 
 
+class FridgePairsDataset(Dataset):
+    """Weakly paired fridge start/stop images with fog applied to the start image.
+
+    Returns (x_stop, x_hazy_from_start, -1). The start/stop images may not be
+    pixel-aligned, so this dataset is intended for feature-drift objectives.
+    """
+
+    IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+    START_SUFFIX = "_start"
+    STOP_SUFFIX = "_stop"
+
+    def __init__(
+        self,
+        root: str,
+        train: bool = True,
+        img_size: int = 128,
+        beta_range: Tuple[float, float] = (3.5, 7.0),
+        a_range: Tuple[float, float] = (0.85, 1.0),
+        blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
+        fog_type: str = "asm",
+        depth_mode: str = "synthetic",
+        fixed_fog: bool = False,
+        recursive: bool = False,
+    ):
+        self.root = Path(root)
+        self.img_size = img_size
+        self.train = train
+        self.beta_range = beta_range
+        self.a_range = a_range
+        self.blur_sigma_range = blur_sigma_range
+        self.fog_type = fog_type
+        self.depth_mode = depth_mode
+        self.fixed_fog = fixed_fog
+        if not self.root.exists():
+            raise FileNotFoundError(f"Fridge pair folder does not exist: {self.root}")
+        if self.depth_mode == "external":
+            raise ValueError("external depth is only supported for folder dataset for now.")
+
+        self.pairs, self.skipped_missing_stop = self._scan_pairs(recursive=recursive)
+        mode = "recursively" if recursive else "non-recursively"
+        print(
+            f"[fridge_pairs] found {len(self.pairs)} start/stop pairs {mode} under "
+            f"{self.root}; skipped {self.skipped_missing_stop} start images with no stop match."
+        )
+        if not self.pairs:
+            extensions = ", ".join(sorted(self.IMG_EXTENSIONS))
+            raise ValueError(
+                f"No fridge start/stop pairs found in {self.root}. Expected files like "
+                f"18127_0_start.jpg and 18127_0_stop.jpg. Supported extensions: {extensions}"
+            )
+
+    def _scan_pairs(self, recursive: bool) -> Tuple[List[Tuple[Path, Path]], int]:
+        iterator = self.root.rglob("*") if recursive else self.root.iterdir()
+        start_paths = sorted(
+            path
+            for path in iterator
+            if (
+                path.is_file()
+                and path.suffix.lower() in self.IMG_EXTENSIONS
+                and path.stem.lower().endswith(self.START_SUFFIX)
+            )
+        )
+        pairs: List[Tuple[Path, Path]] = []
+        skipped = 0
+        for start_path in start_paths:
+            prefix = start_path.stem[: -len(self.START_SUFFIX)]
+            stop_stem = f"{prefix}{self.STOP_SUFFIX}"
+            candidate_suffixes = [start_path.suffix]
+            candidate_suffixes.extend(
+                ext for ext in sorted(self.IMG_EXTENSIONS) if ext != start_path.suffix.lower()
+            )
+            stop_path = None
+            for suffix in candidate_suffixes:
+                candidate = start_path.with_name(f"{stop_stem}{suffix}")
+                if candidate.exists() and candidate.is_file():
+                    stop_path = candidate
+                    break
+            if stop_path is None:
+                skipped += 1
+                continue
+            pairs.append((start_path, stop_path))
+        return sorted(pairs, key=lambda pair: (str(pair[0]), str(pair[1]))), skipped
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def _load_pair(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        start_path, stop_path = self.pairs[idx]
+        with Image.open(start_path) as start_image, Image.open(stop_path) as stop_image:
+            start_image = TF.resize(
+                start_image.convert("RGB"),
+                self.img_size,
+                interpolation=InterpolationMode.BILINEAR,
+            )
+            stop_image = TF.resize(
+                stop_image.convert("RGB"),
+                self.img_size,
+                interpolation=InterpolationMode.BILINEAR,
+            )
+            start_width, start_height = TF.get_image_size(start_image)
+            stop_width, stop_height = TF.get_image_size(stop_image)
+            crop_limit_width = min(start_width, stop_width)
+            crop_limit_height = min(start_height, stop_height)
+            if self.train:
+                max_i = max(0, crop_limit_height - self.img_size)
+                max_j = max(0, crop_limit_width - self.img_size)
+                crop_i = int(torch.randint(max_i + 1, (1,)).item()) if max_i > 0 else 0
+                crop_j = int(torch.randint(max_j + 1, (1,)).item()) if max_j > 0 else 0
+                crop_h = crop_w = self.img_size
+            else:
+                crop_h = crop_w = self.img_size
+                crop_i = max(0, int(round((crop_limit_height - crop_h) / 2.0)))
+                crop_j = max(0, int(round((crop_limit_width - crop_w) / 2.0)))
+
+            start_image = TF.crop(start_image, crop_i, crop_j, crop_h, crop_w)
+            stop_image = TF.crop(stop_image, crop_i, crop_j, crop_h, crop_w)
+            x_start = TF.to_tensor(start_image)
+            x_stop = TF.to_tensor(stop_image)
+            x_start = TF.normalize(x_start, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+            x_stop = TF.normalize(x_stop, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        return x_start, x_stop
+
+    def __getitem__(self, idx: int):
+        x_start, x_stop = self._load_pair(idx)
+        expected_shape = (3, self.img_size, self.img_size)
+        if tuple(x_start.shape) != expected_shape or tuple(x_stop.shape) != expected_shape:
+            raise ValueError(
+                f"Fridge pair should produce {expected_shape}; "
+                f"got start={tuple(x_start.shape)}, stop={tuple(x_stop.shape)}"
+            )
+        x_start = x_start.unsqueeze(0)
+        gen = None
+        if self.fixed_fog:
+            gen = torch.Generator(device=x_start.device).manual_seed(int(idx))
+        x_hazy = apply_selected_fog(
+            x_start,
+            fog_type=self.fog_type,
+            beta_range=self.beta_range,
+            a_range=self.a_range,
+            blur_sigma_range=self.blur_sigma_range,
+            depth_mode=self.depth_mode,
+            generator=gen,
+        )
+        return x_stop, x_hazy.squeeze(0), -1
+
+
 def build_hazy_dataset(
     dataset: str,
     data_dir: str,
@@ -506,6 +652,19 @@ def build_hazy_dataset(
             fixed_fog=fixed_fog,
             recursive=recursive,
         )
+    if name == "fridge_pairs":
+        return FridgePairsDataset(
+            root=data_dir,
+            train=train,
+            img_size=img_size,
+            beta_range=fog_config["beta_range"],
+            a_range=fog_config["a_range"],
+            blur_sigma_range=fog_config["blur_sigma_range"],
+            fog_type=fog_type,
+            depth_mode=depth_mode,
+            fixed_fog=fixed_fog,
+            recursive=recursive,
+        )
     raise ValueError(f"Unknown dataset: {dataset}")
 
 
@@ -513,7 +672,7 @@ def dataset_channels(dataset: str) -> int:
     name = dataset.lower()
     if name == "mnist":
         return 1
-    if name in ("cifar", "cifar10", "folder"):
+    if name in ("cifar", "cifar10", "folder", "fridge_pairs"):
         return 3
     raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -812,6 +971,13 @@ def train(
         raise ValueError(
             "loss_mode=supervised requires at least one supervised weight; "
             "set --lambda_l1 or --lambda_l2."
+        )
+    if name == "fridge_pairs":
+        print(
+            "[fridge_pairs] warning: start/stop images are weakly paired and may not be "
+            "pixel-aligned. Prefer --loss_mode drift --drift_space feature with no pixel "
+            "loss; PSNR/MSE are not strict paired reconstruction metrics unless alignment "
+            "has been manually verified."
         )
     fog_preset, fog_config = resolve_fog_config(name, fog_preset)
     hidden_size, depth, num_heads = resolve_model_config(
@@ -1468,7 +1634,7 @@ def save_metrics(path: Path, metrics: Dict[str, float], run_config: Dict[str, An
 
 def main():
     p = argparse.ArgumentParser(description="Synthetic MNIST/CIFAR-10 dehazing toy example.")
-    p.add_argument("--dataset", choices=["mnist", "cifar10", "folder"], default="mnist")
+    p.add_argument("--dataset", choices=["mnist", "cifar10", "folder", "fridge_pairs"], default="mnist")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--img_size", type=int, default=None)
@@ -1513,7 +1679,7 @@ def main():
     p.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, cuda:0, or mps")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--recursive", action="store_true",
-                   help="Recursively scan image files when --dataset folder.")
+                   help="Recursively scan image files when --dataset folder or fridge_pairs.")
     p.add_argument("--save_fog_debug", action="store_true",
                    help="Save one small fog-generation debug batch before training.")
     p.add_argument("--fog_debug_dir", type=str, default=None,
